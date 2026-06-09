@@ -17,6 +17,92 @@ const {
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
+// ─── Memória do dia: armazena confirmações ────────────────────────────────────
+// { "DD/MM/YYYY": { "Nome Closer": [ { lead, call_date, call_time, confirmed_at, conversationId } ] } }
+const dailyConfirmations = {};
+
+function getTodayKey() {
+  const now = new Date();
+  return now.toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" });
+}
+
+function saveConfirmation(data, conversationId) {
+  const today = getTodayKey();
+  const closer = data.closer_name || "Closer não identificado";
+
+  if (!dailyConfirmations[today]) dailyConfirmations[today] = {};
+  if (!dailyConfirmations[today][closer]) dailyConfirmations[today][closer] = [];
+
+  dailyConfirmations[today][closer].push({
+    lead: data.lead_name || "Lead não identificado",
+    call_date: data.call_date || "—",
+    call_time: data.call_time || "—",
+    confirmed_at: new Date().toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" }),
+    conversationId,
+  });
+}
+
+// ─── Relatório horário no Slack ───────────────────────────────────────────────
+async function sendHourlyReport() {
+  const today = getTodayKey();
+  const byCloser = dailyConfirmations[today];
+
+  if (!byCloser || Object.keys(byCloser).length === 0) return;
+
+  const now = new Date().toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" });
+  const totalGeral = Object.values(byCloser).reduce((acc, arr) => acc + arr.length, 0);
+
+  const blocks = [
+    {
+      type: "header",
+      text: { type: "plain_text", text: `📊 Relatório de Confirmações — ${today} até ${now}`, emoji: true },
+    },
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: `*Total do dia:* ${totalGeral} confirmação${totalGeral !== 1 ? "ões" : ""}` },
+    },
+    { type: "divider" },
+  ];
+
+  for (const [closer, leads] of Object.entries(byCloser)) {
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*👤 ${closer}* — ${leads.length} confirmação${leads.length !== 1 ? "ões" : ""}`,
+      },
+    });
+
+    const leadLines = leads
+      .map((l) => `• ${l.lead} | Call: ${l.call_date} às ${l.call_time} | Confirmado às ${l.confirmed_at}`)
+      .join("\n");
+
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: leadLines },
+    });
+
+    blocks.push({ type: "divider" });
+  }
+
+  await axios.post(SLACK_WEBHOOK_URL, { blocks });
+  console.log(`[${new Date().toISOString()}] Relatório horário enviado ao Slack.`);
+}
+
+// ─── Agenda relatório a cada hora exata ──────────────────────────────────────
+function scheduleHourlyReport() {
+  const now = new Date();
+  const msUntilNextHour =
+    (60 - now.getMinutes()) * 60 * 1000 - now.getSeconds() * 1000 - now.getMilliseconds();
+
+  setTimeout(() => {
+    sendHourlyReport();
+    setInterval(sendHourlyReport, 60 * 60 * 1000);
+  }, msUntilNextHour);
+
+  console.log(`⏰ Próximo relatório em ${Math.round(msUntilNextHour / 60000)} minutos.`);
+}
+
 // ─── Detecta confirmação via OpenAI ──────────────────────────────────────────
 async function isConfirmationMessage(text) {
   const response = await openai.chat.completions.create({
@@ -94,7 +180,7 @@ async function getConversation(conversationId) {
   return response.data;
 }
 
-// ─── Envia notificação para o Slack ──────────────────────────────────────────
+// ─── Envia notificação imediata para o Slack ──────────────────────────────────
 async function sendSlackNotification(data, conversationId) {
   const { lead_name, call_date, call_time, closer_name } = data;
   const chatwootLink = `${CHATWOOT_BASE_URL}/app/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`;
@@ -175,6 +261,10 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`→ Dados extraídos:`, scheduleData);
 
+    // Salva na memória do dia
+    saveConfirmation(scheduleData, conversationId);
+
+    // Envia notificação imediata
     await sendSlackNotification(scheduleData, conversationId);
     console.log(`→ Notificação enviada ao Slack!`);
 
@@ -189,4 +279,5 @@ app.get("/", (req, res) => res.json({ status: "ok", service: "reconecta-webhook"
 
 app.listen(PORT, () => {
   console.log(`🚀 Reconecta Webhook rodando na porta ${PORT}`);
+  scheduleHourlyReport();
 });

@@ -17,11 +17,28 @@ const {
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
+const CLOSER_SLACK_IDS = {
+  "hawinne":  "U0A8HHRPWAY",
+  "andrezza": "U0A44MYEV5Y",
+  "stefany":  "U0B712LCUUQ",
+  "nathan":   "U0AQKCW88KA",
+  "leandro":  "U0AQ422CRS5",
+  "leonardo": "U0ASKV26U9Z",
+};
+
+function getSlackMention(closerName) {
+  if (!closerName) return "Closer não identificado";
+  const lower = closerName.toLowerCase();
+  for (const [key, id] of Object.entries(CLOSER_SLACK_IDS)) {
+    if (lower.includes(key)) return `<@${id}>`;
+  }
+  return closerName;
+}
+
 const dailyConfirmations = {};
 
 function getTodayKey() {
-  const now = new Date();
-  return now.toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" });
+  return new Date().toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" });
 }
 
 function saveConfirmation(data, conversationId) {
@@ -50,7 +67,8 @@ async function sendHourlyReport() {
     { type: "divider" },
   ];
   for (const [closer, leads] of Object.entries(byCloser)) {
-    blocks.push({ type: "section", text: { type: "mrkdwn", text: `*👤 ${closer}* — ${leads.length} confirmação${leads.length !== 1 ? "ões" : ""}` } });
+    const mention = getSlackMention(closer);
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: `*${mention}* — ${leads.length} confirmação${leads.length !== 1 ? "ões" : ""}` } });
     blocks.push({ type: "section", text: { type: "mrkdwn", text: leads.map((l) => `• ${l.lead} | Call: ${l.call_date} às ${l.call_time} | Confirmado às ${l.confirmed_at}`).join("\n") } });
     blocks.push({ type: "divider" });
   }
@@ -69,7 +87,7 @@ async function isConfirmationMessage(text) {
   const response = await openai.chat.completions.create({
     model: "gpt-4o-mini", max_tokens: 10,
     messages: [
-      { role: "system", content: `Você é um classificador de mensagens de WhatsApp de vendas.\nAnalise a mensagem e responda APENAS com "SIM" ou "NÃO".\nA mensagem indica que o cliente confirmou que já entrou em contato, já chamou, já mandou mensagem, já confirmou presença ou agendamento?\nExemplos SIM: "já chamei", "já mandei mensagem", "já confirmei", "já entrei em contato", "mandei sim", "chamei lá", "já fiz isso", "feito", "ok já chamei", "acabei de chamar"\nExemplos NÃO: "tudo bem", "quanto custa?", "quando é?", "pode me ajudar?", "obrigado"` },
+      { role: "system", content: `Você é um classificador de mensagens de WhatsApp de vendas.\nAnalise a mensagem e responda APENAS com "SIM" ou "NÃO".\nA mensagem indica que o cliente confirmou que já entrou em contato, já chamou, já mandou mensagem, já confirmou presença ou agendamento?\nExemplos SIM: "já chamei", "já mandei mensagem", "já confirmei", "já entrei em contato", "mandei sim", "chamei lá", "já fiz isso", "feito", "ok já chamei", "acabei de chamar", "confirmado", "agendado", "pronto", "já fiz"\nExemplos NÃO: "tudo bem", "quanto custa?", "quando é?", "pode me ajudar?", "obrigado"` },
       { role: "user", content: text },
     ],
   });
@@ -108,11 +126,12 @@ async function getConversation(conversationId) {
 async function sendSlackNotification(data, conversationId) {
   const { lead_name, call_date, call_time, closer_name } = data;
   const chatwootLink = `${CHATWOOT_BASE_URL}/app/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}`;
+  const mention = getSlackMention(closer_name);
   await axios.post(SLACK_WEBHOOK_URL, { blocks: [
     { type: "header", text: { type: "plain_text", text: "✅ Agendamento Confirmado!", emoji: true } },
     { type: "section", fields: [
       { type: "mrkdwn", text: `*Lead:*\n${lead_name || "Não identificado"}` },
-      { type: "mrkdwn", text: `*Closer:*\n${closer_name || "Não identificado"}` },
+      { type: "mrkdwn", text: `*Closer:*\n${mention}` },
       { type: "mrkdwn", text: `*Data da Call:*\n${call_date || "Não identificada"}` },
       { type: "mrkdwn", text: `*Horário:*\n${call_time || "Não identificado"}` },
     ]},

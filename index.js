@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const OpenAI = require("openai");
+const { Pool } = require("pg");
 
 const app = express();
 app.use(express.json());
@@ -12,10 +13,12 @@ const {
   CHATWOOT_ACCOUNT_ID,
   SLACK_WEBHOOK_URL,
   OPENAI_API_KEY,
+  DATABASE_URL,
   PORT = 3000,
 } = process.env;
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 const CLOSER_SLACK_IDS = {
   "hawinne":  "U0A8HHRPWAY",
@@ -35,43 +38,71 @@ function getSlackMention(closerName) {
   return closerName;
 }
 
-const dailyConfirmations = {};
-
-function getTodayKey() {
-  return new Date().toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" });
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS confirmations (
+      id SERIAL PRIMARY KEY,
+      lead_name TEXT,
+      closer_name TEXT,
+      call_date TEXT,
+      call_time TEXT,
+      confirmed_at TIMESTAMPTZ DEFAULT NOW(),
+      conversation_id TEXT
+    )
+  `);
+  console.log("✅ Banco de dados pronto.");
 }
 
-function saveConfirmation(data, conversationId) {
-  const today = getTodayKey();
-  const closer = data.closer_name || "Closer não identificado";
-  if (!dailyConfirmations[today]) dailyConfirmations[today] = {};
-  if (!dailyConfirmations[today][closer]) dailyConfirmations[today][closer] = [];
-  dailyConfirmations[today][closer].push({
-    lead: data.lead_name || "Lead não identificado",
-    call_date: data.call_date || "—",
-    call_time: data.call_time || "—",
-    confirmed_at: new Date().toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" }),
-    conversationId,
-  });
+async function saveConfirmation(data, conversationId) {
+  await pool.query(
+    `INSERT INTO confirmations (lead_name, closer_name, call_date, call_time, conversation_id)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [data.lead_name || "Lead não identificado", data.closer_name || "Closer não identificado", data.call_date || null, data.call_time || null, String(conversationId)]
+  );
 }
 
 async function sendHourlyReport() {
-  const today = getTodayKey();
-  const byCloser = dailyConfirmations[today];
-  if (!byCloser || Object.keys(byCloser).length === 0) return;
+  const result = await pool.query(`
+    SELECT closer_name, call_date, call_time, lead_name, confirmed_at, conversation_id
+    FROM confirmations
+    WHERE call_date IS NOT NULL
+    ORDER BY call_date ASC, call_time ASC, closer_name ASC
+  `);
+  if (result.rows.length === 0) return;
+
+  const byDate = {};
+  for (const row of result.rows) {
+    const date = row.call_date || "Data não identificada";
+    const closer = row.closer_name || "Closer não identificado";
+    if (!byDate[date]) byDate[date] = {};
+    if (!byDate[date][closer]) byDate[date][closer] = [];
+    byDate[date][closer].push(row);
+  }
+
   const now = new Date().toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" });
-  const totalGeral = Object.values(byCloser).reduce((acc, arr) => acc + arr.length, 0);
+  const today = new Date().toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" });
+  const totalGeral = result.rows.length;
+
   const blocks = [
-    { type: "header", text: { type: "plain_text", text: `📊 Relatório de Confirmações — ${today} até ${now}`, emoji: true } },
-    { type: "section", text: { type: "mrkdwn", text: `*Total do dia:* ${totalGeral} confirmação${totalGeral !== 1 ? "ões" : ""}` } },
+    { type: "header", text: { type: "plain_text", text: `📊 Relatório de Confirmações — atualizado ${today} às ${now}`, emoji: true } },
+    { type: "section", text: { type: "mrkdwn", text: `*Total geral:* ${totalGeral} confirmação${totalGeral !== 1 ? "ões" : ""}` } },
     { type: "divider" },
   ];
-  for (const [closer, leads] of Object.entries(byCloser)) {
-    const mention = getSlackMention(closer);
-    blocks.push({ type: "section", text: { type: "mrkdwn", text: `*${mention}* — ${leads.length} confirmação${leads.length !== 1 ? "ões" : ""}` } });
-    blocks.push({ type: "section", text: { type: "mrkdwn", text: leads.map((l) => `• ${l.lead} | Call: ${l.call_date} às ${l.call_time} | Confirmado às ${l.confirmed_at}`).join("\n") } });
+
+  for (const [date, closers] of Object.entries(byDate)) {
+    const totalDate = Object.values(closers).reduce((acc, arr) => acc + arr.length, 0);
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: `📅 *Calls do dia ${date}* — ${totalDate} confirmação${totalDate !== 1 ? "ões" : ""}` } });
+    for (const [closer, leads] of Object.entries(closers)) {
+      const mention = getSlackMention(closer);
+      blocks.push({ type: "section", text: { type: "mrkdwn", text: `*${mention}* — ${leads.length} confirmação${leads.length !== 1 ? "ões" : ""}` } });
+      blocks.push({ type: "section", text: { type: "mrkdwn", text: leads.map((l) => {
+        const confirmedAt = new Date(l.confirmed_at).toLocaleTimeString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit" });
+        return `• ${l.lead_name} | Horário da call: ${l.call_time || "—"} | Confirmado às ${confirmedAt}`;
+      }).join("\n") } });
+    }
     blocks.push({ type: "divider" });
   }
+
   await axios.post(SLACK_WEBHOOK_URL, { blocks });
   console.log(`[${new Date().toISOString()}] Relatório enviado ao Slack.`);
 }
@@ -159,7 +190,7 @@ app.post("/webhook", async (req, res) => {
     const scheduleData = await extractScheduleData(conversationTitle, messages);
     if (!scheduleData.lead_name) scheduleData.lead_name = conversation?.meta?.sender?.name || conversation?.contact?.name || null;
     console.log(`→ Dados extraídos:`, scheduleData);
-    saveConfirmation(scheduleData, conversationId);
+    await saveConfirmation(scheduleData, conversationId);
     await sendSlackNotification(scheduleData, conversationId);
     console.log(`→ Notificação enviada ao Slack!`);
     return res.sendStatus(200);
@@ -180,7 +211,8 @@ app.get("/relatorio", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 Reconecta Webhook rodando na porta ${PORT}`);
+  await initDB();
   scheduleHourlyReport();
 });
